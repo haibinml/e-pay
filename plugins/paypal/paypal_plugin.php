@@ -11,12 +11,12 @@ use PayPal\Exception;
 class paypal_plugin
 {
     static public $info = [
-        'name'        => 'paypal', // 支付插件英文名称，需和目录名称一致，不能有重复
-        'showname'    => 'PayPal', // 支付插件显示名称
-        'author'      => 'PayPal', // 支付插件作者
-        'link'        => 'https://www.paypal.com/', // 支付插件作者链接
-        'types'       => ['paypal'], // 支付插件支持的支付方式，可选的有alipay, qqpay, wxpay, bank
-        'inputs' => [ // 支付插件要求传入的参数以及参数显示名称，可选的有appid, appkey, appsecret, appurl, appmchid
+        'name'        => 'paypal', //支付插件英文名称，需和目录名称一致，不能有重复
+        'showname'    => 'PayPal', //支付插件显示名称
+        'author'      => 'PayPal', //支付插件作者
+        'link'        => 'https://www.paypal.com/', //支付插件作者链接
+        'types'       => ['paypal'], //支付插件支持的支付方式，可选的有alipay,qqpay,wxpay,bank
+        'inputs' => [ //支付插件要求传入的参数以及参数显示名称，可选的有appid,appkey,appsecret,appurl,appmchid
             'appid' => [
                 'name' => 'ClientId',
                 'type' => 'input',
@@ -30,13 +30,13 @@ class paypal_plugin
             'appswitch' => [
                 'name' => '模式选择',
                 'type' => 'select',
-                'options' => [0=>'线上模式', 1=>'沙盒模式'],
+                'options' => [0=>'线上模式',1=>'沙盒模式'],
             ],
         ],
         'select' => null,
-        'note' => '', // 支付密钥填写说明
-        'bindwxmp' => false, // 是否支持绑定微信公众号
-        'bindwxa' => false, // 是否支持绑定微信小程序
+        'note' => '', //支付密钥填写说明
+        'bindwxmp' => false, //是否支持绑定微信公众号
+        'bindwxa' => false, //是否支持绑定微信小程序
     ];
 
     static public function submit(){
@@ -44,15 +44,24 @@ class paypal_plugin
 
         require_once(PAY_ROOT."inc/common.php");
 
-        // 将CNY转换为USD，假设汇率为1 CNY = 1 USD / 7
-        $amountInUSD = $order['realmoney'] / 7;
+        $apiContext = new \PayPal\Rest\ApiContext(
+            new \PayPal\Auth\OAuthTokenCredential($channel['appid'], $channel['appkey'])
+        );
+
+        // 获取汇率，优先使用API，失败或超时则使用预设汇率
+        $rate = self::getRate();
+        if (!$rate) {
+            $rate = $conf['settle_usdt_rate'];
+        }
+
+        $usdAmount = $order['realmoney'] / $rate;
 
         $payer = new Payer();
         $payer->setPaymentMethod("paypal");
 
         $amount = new Amount();
         $amount->setCurrency("USD");
-        $amount->setTotal($amountInUSD);
+        $amount->setTotal($usdAmount);
 
         $transaction = new Transaction();
         $transaction->setAmount($amount);
@@ -69,12 +78,9 @@ class paypal_plugin
             ->setRedirectUrls($redirectUrls)
             ->setTransactions(array($transaction));
         try {
-            // 创建支付
             $payment->create($apiContext);
-            // 生成地址
             $approvalUrl = $payment->getApprovalLink();
 
-            // 跳转
             return ['type'=>'jump','url'=>$approvalUrl];
         }
         catch (\Exception $ex) {
@@ -89,7 +95,6 @@ class paypal_plugin
         require_once(PAY_ROOT."inc/common.php");
 
         if (isset($_GET['paymentId']) && isset($_GET['PayerID'])) {
-
             $paymentId = $_GET['paymentId'];
             try {
                 $payment = Payment::get($paymentId, $apiContext);
@@ -102,12 +107,12 @@ class paypal_plugin
 
             $amount = new Amount();
             $amount->setCurrency('USD');
-            $amount->setTotal($order['realmoney'] / $conf['settle_usdt_rate']);
+            $amount->setTotal($order['realmoney']);
 
             $transaction = new Transaction();
             $transaction->setAmount($amount);
 
-            $execution->addTransaction($transaction); 
+            $execution->addTransaction($transaction);
 
             try {
                 $result = $payment->execute($execution, $apiContext);
@@ -115,12 +120,11 @@ class paypal_plugin
                 $payer = $result->payer->payer_info->email;
                 $out_trade_no = $result->transactions[0]->invoice_number;
 
-                if($out_trade_no == TRADE_NO){
+                if ($out_trade_no == TRADE_NO) {
                     processReturn($order, $paymentId, $payer);
-                }else{
+                } else {
                     return ['type'=>'error','msg'=>'订单信息校验失败'];
                 }
-
             } catch (\Exception $ex) {
                 return ['type'=>'error','msg'=>'支付失败 '.$ex->getMessage()];
             }
@@ -131,5 +135,35 @@ class paypal_plugin
 
     static public function cancel(){
         return ['type'=>'page','page'=>'error'];
+    }
+
+    // 获取汇率
+    static public function getRate() {
+        global $channel, $conf;
+
+        if ($channel['appswitch'] == 1) { // 如果是沙盒模式，直接返回设置的汇率
+            return $conf['settle_usdt_rate'];
+        }
+
+        // 使用API获取汇率，超时时间为5秒
+        $api = 'https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail/chart?id=825&range=1H&convertId=2787';
+        $options = [
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 5 // 设置超时时间为5秒
+            ]
+        ];
+        $context = stream_context_create($options);
+        $resp = @file_get_contents($api, false, $context);
+        
+        if ($resp === FALSE) {
+            return $conf['settle_usdt_rate'];
+        }
+
+        $data = json_decode($resp, true);
+        $points = $data['data']['points'];
+        $point = array_pop($points);
+
+        return floatval($point['c'][0]);
     }
 }
